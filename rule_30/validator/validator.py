@@ -12,12 +12,16 @@ from fiber.chain.chain_utils import load_hotkey_keypair
 from fiber.chain.interface import get_substrate
 from fiber.chain.metagraph import Metagraph
 from fiber.chain.models import Node
+from fiber.logging_utils import get_logger
 from fiber.validator.client import make_non_streamed_post, make_non_streamed_get
 from fiber.validator.handshake import perform_handshake
 from httpx import AsyncClient
 from substrateinterface import Keypair, SubstrateInterface
 
 from .config import get_config
+
+
+logger = get_logger(__name__)
 
 
 class Validator:
@@ -83,6 +87,8 @@ class Validator:
         return full_path / "state.npz"
 
     def save_state(self):
+        logger.log("save_state")
+
         numpy.savez(
             self.state_path,
             step=self.step,
@@ -93,6 +99,8 @@ class Validator:
         )
 
     def load_state(self):
+        logger.log("load_state")
+
         path = self.state_path
 
         if not exists(path):
@@ -107,12 +115,16 @@ class Validator:
         self.hotkeys = state["hotkeys"]
 
     def sync(self):
+        logger.log("sync")
+
         self.metagraph.sync_nodes()
         self.valid_miners.clear()
 
         for hotkey, node in self.metagraph.nodes.items():
             if hotkey != self.hotkeys[node.node_id]:
                 self.hotkeys[node.node_id] = hotkey
+
+        logger.log("Checking active miners")
 
         current_steps = asyncio.gather(*(
             self.make_request(node, "current_step")
@@ -174,6 +186,8 @@ class Validator:
         return nodes
 
     async def do_step(self):
+        logger.log(f"Evolution step {self.step}")
+
         iterator = iter(self.current_row)
 
         chunk_size = numpy.ceil(len(self.current_row) / len(self.valid_miners))
@@ -211,8 +225,17 @@ class Validator:
 
         responses[0][1] |= (0b11 << (response.bit_length() - 2))
 
+        # TODO update center_column and current_row
+        self.step += 1
+
+        self.save_state()
+
     async def run(self):
-        pass
+        while True:
+            try:
+                await self.do_step()
+            except:
+                logger.error(f"Error in evolution step {self.step}", exc_info=True)
 
 
 def main():
