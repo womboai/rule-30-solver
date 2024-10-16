@@ -17,10 +17,10 @@ from fiber.logging_utils import get_logger
 from fiber.validator.client import make_non_streamed_post, make_non_streamed_get
 from fiber.validator.handshake import perform_handshake
 from httpx import AsyncClient, Response
+from numpy.typing import NDArray
 from substrateinterface import Keypair, SubstrateInterface
 
 from .config import get_config
-
 
 logger = get_logger(__name__)
 
@@ -35,8 +35,8 @@ class Validator:
     client: AsyncClient
 
     step: numpy.uint64
-    current_row: numpy.ndarray  # dtype = numpy.uint64
-    center_column: numpy.ndarray  # dtype = numpy.uint64
+    current_row: NDArray[numpy.uint64]
+    center_column: NDArray[numpy.uint64]
     scores: list[float]
 
     valid_miners: list[int]
