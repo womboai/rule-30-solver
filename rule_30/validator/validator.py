@@ -1,5 +1,6 @@
 import asyncio
-from itertools import islice
+from collections.abc import Iterable
+from itertools import islice, chain
 from os import makedirs
 from os.path import exists
 from pathlib import Path
@@ -15,7 +16,7 @@ from fiber.chain.models import Node
 from fiber.logging_utils import get_logger
 from fiber.validator.client import make_non_streamed_post, make_non_streamed_get
 from fiber.validator.handshake import perform_handshake
-from httpx import AsyncClient
+from httpx import AsyncClient, Response
 from substrateinterface import Keypair, SubstrateInterface
 
 from .config import get_config
@@ -64,7 +65,7 @@ class Validator:
 
         self.client = AsyncClient()
 
-        self.step = numpy.uint64(0)
+        self.step = numpy.uint64(1)
         self.current_row = numpy.array([1], dtype=numpy.uint64)
         self.center_column = numpy.array([1], dtype=numpy.uint64)
         self.valid_miners = []
@@ -199,7 +200,7 @@ class Validator:
             for uid in self.valid_miners
         ]
 
-        responses = await asyncio.gather(*(
+        responses: Iterable[tuple[Response, float]] = await asyncio.gather(*(
             self.make_request(
                 node,
                 "compute",
@@ -210,7 +211,7 @@ class Validator:
             for node, chunk in chunks
         ))
 
-        responses = [
+        responses: list[tuple[int, list[int] | None, float]] = [
             (uid, response.json()["parts"] if response else None, inference_time)
             for uid, (response, inference_time) in zip(self.valid_miners, responses)
         ]
@@ -221,11 +222,13 @@ class Validator:
             else:
                 self.scores[uid] = 1 / inference_time
 
-        response = responses[0][1]
+        self.current_row = numpy.array(list(chain(response[1]) for response in reversed(responses)), dtype=numpy.uint64)
 
-        responses[0][1] |= (0b11 << (response.bit_length() - 2))
+        bit_index = self.step % 64
+        current_row_part = self.current_row[self.step / 64]
 
-        # TODO update center_column and current_row
+        self.center_column[-1] = self.center_column[-1] | (current_row_part >> bit_index << bit_index)
+
         self.step += 1
 
         self.save_state()
