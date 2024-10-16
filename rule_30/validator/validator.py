@@ -222,7 +222,7 @@ class Validator:
             else:
                 self.scores[uid] = 1 / inference_time
 
-        self.current_row = numpy.array(list(chain(response[1]) for response in reversed(responses)), dtype=numpy.uint64)
+        self.current_row = numpy.array(list(chain(response[1] for response in responses)), dtype=numpy.uint64)
 
         bit_index = self.step % 64
         current_row_part = self.current_row[self.step / 64]
