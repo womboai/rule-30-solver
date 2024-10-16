@@ -6,7 +6,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-import numpy
+from miner import sample_miner
+import numpy as np
 from cryptography.fernet import Fernet
 from fiber.chain.chain_utils import load_hotkey_keypair
 from fiber.chain.interface import get_substrate
@@ -236,7 +237,23 @@ class Validator:
                 await self.do_step()
             except:
                 logger.error(f"Error in evolution step {self.step}", exc_info=True)
-
+    
+    async def normalize_scores(self, outputs: np.ndarray) -> np.ndarray:
+        def normalize_pair(a: np.uint64, b: np.uint64) -> tuple[np.uint64, np.uint64]:
+            carry = a & 1
+            a = a >> 1
+            b = (carry << (b.bit_length())) | b
+            a, b = sample_miner(np.array([a, b], dtype=np.uint64))
+            msb = b >> (b.dtype.itemsize * 8 - 1)
+            b = b & ((1 << (b.dtype.itemsize * 8 - 1)) - 1)
+            a = (a << 1) | msb
+            return a, b
+        normalized_outputs = []
+        for i in range(len(outputs)-2):
+            a,b = normalize_pair(outputs[i][0],outputs[i+1][-1])
+            normalized_outputs.append(a)
+            normalized_outputs.append(b)
+        return normalized_outputs
 
 def main():
     asyncio.run(Validator().run())
