@@ -7,7 +7,6 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from miner import sample_miner
 import numpy as np
 from cryptography.fernet import Fernet
 from fiber.chain.chain_utils import load_hotkey_keypair
@@ -35,9 +34,9 @@ class Validator:
     metagraph: Metagraph
     client: AsyncClient
 
-    step: numpy.uint64
-    current_row: NDArray[numpy.uint64]
-    center_column: NDArray[numpy.uint64]
+    step: np.uint64
+    current_row: NDArray[np.uint64]
+    center_column: NDArray[np.uint64]
     scores: list[float]
 
     valid_miners: list[int]
@@ -66,9 +65,9 @@ class Validator:
 
         self.client = AsyncClient()
 
-        self.step = numpy.uint64(1)
-        self.current_row = numpy.array([1], dtype=numpy.uint64)
-        self.center_column = numpy.array([1], dtype=numpy.uint64)
+        self.step = np.uint64(1)
+        self.current_row = np.array([1], dtype=np.uint64)
+        self.center_column = np.array([1], dtype=np.uint64)
         self.valid_miners = []
         self.hotkeys = list(self.metagraph.nodes)
 
@@ -91,7 +90,7 @@ class Validator:
     def save_state(self):
         logger.log("save_state")
 
-        numpy.savez(
+        np.savez(
             self.state_path,
             step=self.step,
             current_row=self.current_row,
@@ -108,7 +107,7 @@ class Validator:
         if not exists(path):
             return
 
-        state = numpy.load(path)
+        state = np.load(path)
 
         self.step = state["step"]
         self.current_row = state["current_row"]
@@ -133,7 +132,7 @@ class Validator:
             for node in self.metagraph.nodes.values()
         ))
 
-        self.valid_miners.extend(*numpy.where(current_steps == self.step))
+        self.valid_miners.extend(*np.where(current_steps == self.step))
 
     async def make_request(self, node: Node, endpoint: str, payload: dict[str, Any] | None = None):
         miner_address = f"http://{node.ip}:{node.port}"
@@ -192,7 +191,7 @@ class Validator:
 
         iterator = iter(self.current_row)
 
-        chunk_size = numpy.ceil(len(self.current_row) / len(self.valid_miners))
+        chunk_size = np.ceil(len(self.current_row) / len(self.valid_miners))
 
         nodes = self.nodes_list()
 
@@ -223,7 +222,12 @@ class Validator:
             else:
                 self.scores[uid] = 1 / inference_time
 
-        self.current_row = numpy.array(list(chain(response[1] for response in responses)), dtype=numpy.uint64)
+        data = [
+            np.array(response, dtype=np.uint64)
+            for _, response, _ in responses
+        ]
+
+        self.current_row = self.normalize_response_data(data)
 
         bit_index = self.step % 64
         current_row_part = self.current_row[self.step / 64]
@@ -240,8 +244,8 @@ class Validator:
                 await self.do_step()
             except:
                 logger.error(f"Error in evolution step {self.step}", exc_info=True)
-    
-    async def normalize_scores(self, outputs: np.ndarray) -> np.ndarray:
+
+    async def normalize_response_data(self, outputs: list[NDArray[np.uint64]]) -> NDArray[np.uint64]:
         def normalize_pair(a: np.uint64, b: np.uint64) -> tuple[np.uint64, np.uint64]:
             carry = a & 1
             a = a >> 1
@@ -252,11 +256,14 @@ class Validator:
             a = (a << 1) | msb
             return a, b
         normalized_outputs = []
+
         for i in range(len(outputs)-2):
-            a,b = normalize_pair(outputs[i][0],outputs[i+1][-1])
+            a, b = normalize_pair(outputs[i][0], outputs[i+1][-1])
             normalized_outputs.append(a)
             normalized_outputs.append(b)
-        return normalized_outputs
+
+        return np.array(normalized_outputs, dtype=np.uint64)
+
 
 def main():
     asyncio.run(Validator().run())
