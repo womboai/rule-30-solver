@@ -1,0 +1,219 @@
+import asyncio
+from itertools import islice
+from os import makedirs
+from os.path import exists
+from pathlib import Path
+from time import perf_counter
+from typing import Any
+
+import numpy
+from cryptography.fernet import Fernet
+from fiber.chain.chain_utils import load_hotkey_keypair
+from fiber.chain.interface import get_substrate
+from fiber.chain.metagraph import Metagraph
+from fiber.chain.models import Node
+from fiber.validator.client import make_non_streamed_post, make_non_streamed_get
+from fiber.validator.handshake import perform_handshake
+from httpx import AsyncClient
+from substrateinterface import Keypair, SubstrateInterface
+
+from .config import get_config
+
+
+class Validator:
+    wallet_name: str
+    wallet_hotkey: str
+
+    keypair: Keypair
+    substrate: SubstrateInterface
+    metagraph: Metagraph
+    client: AsyncClient
+
+    step: numpy.uint64
+    current_row: numpy.ndarray  # dtype = numpy.uint64
+    center_column: numpy.ndarray  # dtype = numpy.uint64
+    scores: list[float]
+
+    valid_miners: list[int]
+    hotkeys: list[str]
+
+    def __init__(self):
+        config = get_config()
+
+        self.wallet_name = config["wallet.name"]
+        self.wallet_hotkey = config["wallet.hotkey"]
+
+        self.keypair = load_hotkey_keypair(self.wallet_name, self.wallet_hotkey)
+
+        self.substrate = get_substrate(
+            subtensor_network=config["subtensor.network"],
+            subtensor_address=config["subtensor.chain_endpoint"],
+        )
+
+        self.metagraph = Metagraph(
+            substrate=self.substrate,
+            netuid=config["netuid"],
+            load_old_nodes=False
+        )
+
+        self.metagraph.sync_nodes()
+
+        self.client = AsyncClient()
+
+        self.step = numpy.uint64(0)
+        self.current_row = numpy.array([1], dtype=numpy.uint64)
+        self.center_column = numpy.array([1], dtype=numpy.uint64)
+        self.valid_miners = []
+        self.hotkeys = list(self.metagraph.nodes)
+
+    @property
+    def state_path(self):
+        full_path = (
+            Path.home() /
+            ".bittensor" /
+            "miners" /
+            self.wallet_name /
+            self.wallet_hotkey /
+            f"netuid{self.metagraph.netuid}" /
+            "validator"
+        )
+
+        makedirs(full_path, exist_ok=True)
+
+        return full_path / "state.npz"
+
+    def save_state(self):
+        numpy.savez(
+            self.state_path,
+            step=self.step,
+            current_row=self.current_row,
+            center_column=self.center_column,
+            valid_miners=self.valid_miners,
+            hotkeys=self.hotkeys,
+        )
+
+    def load_state(self):
+        path = self.state_path
+
+        if not exists(path):
+            return
+
+        state = numpy.load(path)
+
+        self.step = state["step"]
+        self.current_row = state["current_row"]
+        self.center_column = state["center_column"]
+        self.valid_miners = state["valid_miners"]
+        self.hotkeys = state["hotkeys"]
+
+    def sync(self):
+        self.metagraph.sync_nodes()
+        self.valid_miners.clear()
+
+        for hotkey, node in self.metagraph.nodes.items():
+            if hotkey != self.hotkeys[node.node_id]:
+                self.hotkeys[node.node_id] = hotkey
+
+        current_steps = asyncio.gather(*(
+            self.make_request(node, "current_step")
+            for node in self.metagraph.nodes.values()
+        ))
+
+        self.valid_miners.extend(*numpy.where(current_steps == self.step))
+
+    async def make_request(self, node: Node, endpoint: str, payload: dict[str, Any] | None = None):
+        miner_address = f"http://{node.ip}:{node.port}"
+
+        symmetric_key_str, symmetric_key_uuid = await perform_handshake(
+            keypair=self.keypair,
+            httpx_client=self.client,
+            server_address=miner_address,
+            miner_hotkey_ss58_address=node.hotkey,
+        )
+
+        if symmetric_key_str is None or symmetric_key_uuid is None:
+            return None
+
+        start = perf_counter()
+
+        if payload:
+            fernet = Fernet(symmetric_key_str)
+
+            resp = await make_non_streamed_post(
+                httpx_client=self.client,
+                server_address=miner_address,
+                fernet=fernet,
+                keypair=self.keypair,
+                symmetric_key_uuid=symmetric_key_uuid,
+                validator_ss58_address=self.keypair.ss58_address,
+                miner_ss58_address=node.hotkey,
+                payload=payload,
+                endpoint=f"/{endpoint}",
+            )
+        else:
+            resp = await make_non_streamed_get(
+                httpx_client=self.client,
+                server_address=miner_address,
+                symmetric_key_uuid=symmetric_key_uuid,
+                validator_ss58_address=self.keypair.ss58_address,
+                endpoint=f"/{endpoint}",
+            )
+
+        inference_time = perf_counter() - start
+
+        resp.raise_for_status()
+
+        return resp, inference_time
+
+    def nodes_list(self) -> list[Node]:
+        nodes: list[Node | None] = len(self.metagraph.nodes) * [None]
+
+        for node in self.metagraph.nodes.values():
+            nodes[node.node_id] = node
+
+        return nodes
+
+    async def do_step(self):
+        iterator = iter(self.current_row)
+
+        chunk_size = numpy.ceil(len(self.current_row) / len(self.valid_miners))
+
+        nodes = self.nodes_list()
+
+        chunks = [
+            (nodes[uid], list(islice(iterator, chunk_size)))
+            for uid in self.valid_miners
+        ]
+
+        responses = await asyncio.gather(*(
+            self.make_request(
+                node,
+                "compute",
+                {
+                    "parts": chunk
+                }
+            )
+            for node, chunk in chunks
+        ))
+
+        responses = [
+            (uid, response.json()["parts"] if response else None, inference_time)
+            for uid, (response, inference_time) in zip(self.valid_miners, responses)
+        ]
+
+        for (uid, response, inference_time) in responses:
+            if not response:
+                self.scores[uid] = 0.0
+            else:
+                self.scores[uid] = 1 / inference_time
+
+        response = responses[0][1]
+
+        responses[0][1] |= (0b11 << (response.bit_length() - 2))
+
+    async def run(self):
+        pass
+
+
+def main():
+    asyncio.run(Validator().run())

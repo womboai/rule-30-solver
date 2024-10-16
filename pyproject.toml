@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "rule-30-solver"
+version = "0.1.0"
+description = ""
+authors = ["WOMBO <hello@wombo.ai>"]
+readme = "README.md"
+packages = [{ include = "src/rule_30" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+numpy = "2.1.2"
+fiber = { git = "https://github.com/rayonlabs/fiber", tag = "1.0.0" }
+
+[tool.poetry.extras]
+fiber = ["full"]
+
+[tool.poetry.scripts]
+start_miner = "rule30.miner:main"
+start_validator = "rule30.validator:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
