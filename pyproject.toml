@@ -4,7 +4,7 @@ version = "0.1.0"
 description = ""
 authors = ["WOMBO <hello@wombo.ai>"]
 readme = "README.md"
-packages = [{ include = "src/rule_30" }]
+packages = [{ include = "rule_30" }]
 
 [tool.poetry.dependencies]
 python = "^3.10"
