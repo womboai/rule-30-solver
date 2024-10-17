@@ -1,11 +1,12 @@
 import os
 import sys
-from itertools import chain
 
 import uvicorn
 from fiber.logging_utils import get_logger
 from fiber.miner import server
 from fiber.miner.middleware import configure_extra_logging_middleware
+from numpy.typing import NDArray
+import numpy as np
 
 logger = get_logger(__name__)
 
@@ -16,13 +17,16 @@ app.include_router(get_subnet_router())
 
 if os.getenv("ENV", "dev").lower() == "dev":
     configure_extra_logging_middleware(app)
- 
-def sample_miner(int_list: list[int]) -> list[int]:
-    combined_int = int.from_bytes(b''.join(num.to_bytes(8, 'little') for num in int_list), "little")
+
+
+def compute_response(data: NDArray[np.uint64]) -> NDArray[np.uint64]:
+    raw_bytes = data.tobytes()
+    combined_int = int.from_bytes(raw_bytes, "little")
     transformed_int = combined_int ^ ((combined_int << 1) | (combined_int << 2))
-    masked_int = (transformed_int >> 1) & ((1 << (transformed_int.bit_length() - 2)) - 1)
-    transformed_bytes = masked_int.to_bytes((masked_int.bit_length() + 7) // 8, 'little')
-    return [int.from_bytes(transformed_bytes[i:i+8], "little") for i in range(0, len(transformed_bytes), 8)]
+    transformed_bytes = transformed_int.to_bytes(len(raw_bytes), 'little')
+
+    return np.frombuffer(transformed_bytes, dtype=np.uint64)
+
 
 def main():
     sys.argv.append("rule_30.miner:app")

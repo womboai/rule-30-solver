@@ -1,13 +1,14 @@
 import asyncio
-from itertools import islice
+from collections.abc import Iterable
+from itertools import islice, chain
 from os import makedirs
 from os.path import exists
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, TypeAlias
 
-from miner import sample_miner
 import numpy as np
+import wandb
 from cryptography.fernet import Fernet
 from fiber.chain.chain_utils import load_hotkey_keypair
 from fiber.chain.interface import get_substrate
@@ -16,48 +17,53 @@ from fiber.chain.models import Node
 from fiber.logging_utils import get_logger
 from fiber.validator.client import make_non_streamed_post, make_non_streamed_get
 from fiber.validator.handshake import perform_handshake
-from httpx import AsyncClient
+from httpx import AsyncClient, Response
+from numpy.typing import NDArray
 from substrateinterface import Keypair, SubstrateInterface
+from wandb.sdk.wandb_run import Run
 
-from .config import get_config
-
+from .config import SUBTENSOR_NETWORK, SUBTENSOR_ADDRESS, NETUID, WALLET_NAME, HOTKEY_NAME
+from ..wandb_config import WANDB_REFRESH_INTERVAL, WANDB_PROJECT, WANDB_ENTITY
 
 logger = get_logger(__name__)
 
 
-class Validator:
-    wallet_name: str
-    wallet_hotkey: str
+VALIDATOR_VERSION: tuple[int, int, int] = (4, 0, 5)
+VALIDATOR_VERSION_STRING = ".".join(map(str, VALIDATOR_VERSION))
 
+Block: TypeAlias = int
+Uid: TypeAlias = int
+SS58Key: TypeAlias = str
+
+
+class Validator:
     keypair: Keypair
     substrate: SubstrateInterface
     metagraph: Metagraph
     client: AsyncClient
 
-    step: numpy.uint64
-    current_row: numpy.ndarray  # dtype = numpy.uint64
-    center_column: numpy.ndarray  # dtype = numpy.uint64
+    step: np.uint64
+    current_row: NDArray[np.uint64]
+    center_column: NDArray[np.uint64]
     scores: list[float]
 
-    valid_miners: list[int]
-    hotkeys: list[str]
+    valid_miners: list[Uid]
+    hotkeys: list[SS58Key]
+
+    last_wandb_run: Block
+    wandb_run: Run
 
     def __init__(self):
-        config = get_config()
-
-        self.wallet_name = config["wallet.name"]
-        self.wallet_hotkey = config["wallet.hotkey"]
-
-        self.keypair = load_hotkey_keypair(self.wallet_name, self.wallet_hotkey)
+        self.keypair = load_hotkey_keypair(WALLET_NAME, HOTKEY_NAME)
 
         self.substrate = get_substrate(
-            subtensor_network=config["subtensor.network"],
-            subtensor_address=config["subtensor.chain_endpoint"],
+            subtensor_network=SUBTENSOR_NETWORK,
+            subtensor_address=SUBTENSOR_ADDRESS,
         )
 
         self.metagraph = Metagraph(
             substrate=self.substrate,
-            netuid=config["netuid"],
+            netuid=NETUID,
             load_old_nodes=False
         )
 
@@ -65,11 +71,13 @@ class Validator:
 
         self.client = AsyncClient()
 
-        self.step = numpy.uint64(0)
-        self.current_row = numpy.array([1], dtype=numpy.uint64)
-        self.center_column = numpy.array([1], dtype=numpy.uint64)
+        self.step = np.uint64(1)
+        self.current_row = np.array([1], dtype=np.uint64)
+        self.center_column = np.array([1], dtype=np.uint64)
         self.valid_miners = []
         self.hotkeys = list(self.metagraph.nodes)
+
+        self.new_wandb_run()
 
     @property
     def state_path(self):
@@ -77,8 +85,8 @@ class Validator:
             Path.home() /
             ".bittensor" /
             "miners" /
-            self.wallet_name /
-            self.wallet_hotkey /
+            WALLET_NAME /
+            HOTKEY_NAME /
             f"netuid{self.metagraph.netuid}" /
             "validator"
         )
@@ -90,7 +98,7 @@ class Validator:
     def save_state(self):
         logger.log("save_state")
 
-        numpy.savez(
+        np.savez(
             self.state_path,
             step=self.step,
             current_row=self.current_row,
@@ -107,7 +115,7 @@ class Validator:
         if not exists(path):
             return
 
-        state = numpy.load(path)
+        state = np.load(path)
 
         self.step = state["step"]
         self.current_row = state["current_row"]
@@ -132,7 +140,44 @@ class Validator:
             for node in self.metagraph.nodes.values()
         ))
 
-        self.valid_miners.extend(*numpy.where(current_steps == self.step))
+        self.valid_miners.extend(*np.where(current_steps == self.step))
+
+    def new_wandb_run(self, block: Block | None = None):
+        if not block:
+            block = self.substrate.get_block_number(None)  # type: ignore
+
+        self.wandb_run = wandb.init(
+            name=f"validator-{self.metagraph.netuid}-{self.step}-{block}",
+            project=WANDB_PROJECT,
+            entity=WANDB_ENTITY,
+            tags=[
+                f"version_{VALIDATOR_VERSION_STRING}",
+            ],
+            config={
+                "version": VALIDATOR_VERSION_STRING,
+                "hotkey": self.keypair.ss58_address,
+                "uid": self.metagraph.nodes[self.keypair.ss58_address].node_id,
+            },
+        )
+
+        self.last_wandb_run = block
+
+    def check_wandb_run(self):
+        if not self.wandb_run:
+            return
+
+        self.wandb_run.log(
+            {
+                "center_column": self.center_column.tolist(),
+                "current_evolution": self.current_row.tolist(),
+            },
+            step=self.step.item(),
+        )
+
+        current_block = self.substrate.get_block_number(None)  # type: ignore
+
+        if current_block - self.last_wandb_run > WANDB_REFRESH_INTERVAL:
+            self.new_wandb_run(current_block)
 
     async def make_request(self, node: Node, endpoint: str, payload: dict[str, Any] | None = None):
         miner_address = f"http://{node.ip}:{node.port}"
@@ -191,7 +236,7 @@ class Validator:
 
         iterator = iter(self.current_row)
 
-        chunk_size = numpy.ceil(len(self.current_row) / len(self.valid_miners))
+        chunk_size = np.ceil(len(self.current_row) / len(self.valid_miners))
 
         nodes = self.nodes_list()
 
@@ -200,7 +245,7 @@ class Validator:
             for uid in self.valid_miners
         ]
 
-        responses = await asyncio.gather(*(
+        responses: Iterable[tuple[Response, float]] = await asyncio.gather(*(
             self.make_request(
                 node,
                 "compute",
@@ -211,7 +256,7 @@ class Validator:
             for node, chunk in chunks
         ))
 
-        responses = [
+        responses: list[tuple[int, list[int] | None, float]] = [
             (uid, response.json()["parts"] if response else None, inference_time)
             for uid, (response, inference_time) in zip(self.valid_miners, responses)
         ]
@@ -222,14 +267,23 @@ class Validator:
             else:
                 self.scores[uid] = 1 / inference_time
 
-        response = responses[0][1]
+        data = [
+            np.array(response, dtype=np.uint64)
+            for _, response, _ in responses
+        ]
 
-        responses[0][1] |= (0b11 << (response.bit_length() - 2))
+        self.current_row = self.normalize_response_data(data)
 
-        # TODO update center_column and current_row
+        bit_index = self.step % 64
+        current_row_part = self.current_row[self.step / 64]
+
+        self.center_column[-1] = self.center_column[-1] | (current_row_part >> bit_index << bit_index)
+
         self.step += 1
 
         self.save_state()
+
+        self.check_wandb_run()
 
     async def run(self):
         while True:
@@ -242,6 +296,7 @@ class Validator:
     async def normalize_scores(self, outputs: np.ndarray[np.ndarray[np.uint64]]) -> np.ndarray[np.uint64]:
         def rule_30(a: np.uint64) -> np.uint64:
             return np.uint64(a ^ (a << np.uint64(1) | a << np.uint64(2)))
+
         def normalize_pair(a: np.uint64, b: np.uint64) -> tuple[np.uint64, np.uint64]:
             carry = np.uint64(a & np.uint64(1))
 
@@ -275,6 +330,7 @@ class Validator:
         normalized_outputs.extend(outputs[-1].astype(np.uint64))
 
         return np.array(normalized_outputs, dtype=np.uint64)
+
 
 def main():
     asyncio.run(Validator().run())
