@@ -9,6 +9,7 @@ packages = [{ include = "rule_30" }]
 [tool.poetry.dependencies]
 python = "^3.10"
 numpy = "2.1.2"
+wandb = "0.18.3"
 fiber = { git = "https://github.com/rayonlabs/fiber", tag = "1.0.0" }
 
 [tool.poetry.extras]

@@ -5,9 +5,10 @@ from os import makedirs
 from os.path import exists
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
+import wandb
 from cryptography.fernet import Fernet
 from fiber.chain.chain_utils import load_hotkey_keypair
 from fiber.chain.interface import get_substrate
@@ -19,16 +20,23 @@ from fiber.validator.handshake import perform_handshake
 from httpx import AsyncClient, Response
 from numpy.typing import NDArray
 from substrateinterface import Keypair, SubstrateInterface
+from wandb.sdk.wandb_run import Run
 
-from .config import get_config
+from .config import SUBTENSOR_NETWORK, SUBTENSOR_ADDRESS, NETUID, WALLET_NAME, HOTKEY_NAME
+from ..wandb_config import WANDB_REFRESH_INTERVAL, WANDB_PROJECT, WANDB_ENTITY
 
 logger = get_logger(__name__)
 
 
-class Validator:
-    wallet_name: str
-    wallet_hotkey: str
+VALIDATOR_VERSION: tuple[int, int, int] = (4, 0, 5)
+VALIDATOR_VERSION_STRING = ".".join(map(str, VALIDATOR_VERSION))
 
+Block: TypeAlias = int
+Uid: TypeAlias = int
+SS58Key: TypeAlias = str
+
+
+class Validator:
     keypair: Keypair
     substrate: SubstrateInterface
     metagraph: Metagraph
@@ -39,25 +47,23 @@ class Validator:
     center_column: NDArray[np.uint64]
     scores: list[float]
 
-    valid_miners: list[int]
-    hotkeys: list[str]
+    valid_miners: list[Uid]
+    hotkeys: list[SS58Key]
+
+    last_wandb_run: Block
+    wandb_run: Run
 
     def __init__(self):
-        config = get_config()
-
-        self.wallet_name = config["wallet.name"]
-        self.wallet_hotkey = config["wallet.hotkey"]
-
-        self.keypair = load_hotkey_keypair(self.wallet_name, self.wallet_hotkey)
+        self.keypair = load_hotkey_keypair(WALLET_NAME, HOTKEY_NAME)
 
         self.substrate = get_substrate(
-            subtensor_network=config["subtensor.network"],
-            subtensor_address=config["subtensor.chain_endpoint"],
+            subtensor_network=SUBTENSOR_NETWORK,
+            subtensor_address=SUBTENSOR_ADDRESS,
         )
 
         self.metagraph = Metagraph(
             substrate=self.substrate,
-            netuid=config["netuid"],
+            netuid=NETUID,
             load_old_nodes=False
         )
 
@@ -71,14 +77,16 @@ class Validator:
         self.valid_miners = []
         self.hotkeys = list(self.metagraph.nodes)
 
+        self.new_wandb_run()
+
     @property
     def state_path(self):
         full_path = (
             Path.home() /
             ".bittensor" /
             "miners" /
-            self.wallet_name /
-            self.wallet_hotkey /
+            WALLET_NAME /
+            HOTKEY_NAME /
             f"netuid{self.metagraph.netuid}" /
             "validator"
         )
@@ -133,6 +141,43 @@ class Validator:
         ))
 
         self.valid_miners.extend(*np.where(current_steps == self.step))
+
+    def new_wandb_run(self, block: Block | None = None):
+        if not block:
+            block = self.substrate.get_block_number(None)  # type: ignore
+
+        self.wandb_run = wandb.init(
+            name=f"validator-{self.metagraph.netuid}-{self.step}-{block}",
+            project=WANDB_PROJECT,
+            entity=WANDB_ENTITY,
+            tags=[
+                f"version_{VALIDATOR_VERSION_STRING}",
+            ],
+            config={
+                "version": VALIDATOR_VERSION_STRING,
+                "hotkey": self.keypair.ss58_address,
+                "uid": self.metagraph.nodes[self.keypair.ss58_address].node_id,
+            },
+        )
+
+        self.last_wandb_run = block
+
+    def check_wandb_run(self):
+        if not self.wandb_run:
+            return
+
+        self.wandb_run.log(
+            {
+                "center_column": self.center_column.tolist(),
+                "current_evolution": self.current_row.tolist(),
+            },
+            step=self.step.item(),
+        )
+
+        current_block = self.substrate.get_block_number(None)  # type: ignore
+
+        if current_block - self.last_wandb_run > WANDB_REFRESH_INTERVAL:
+            self.new_wandb_run(current_block)
 
     async def make_request(self, node: Node, endpoint: str, payload: dict[str, Any] | None = None):
         miner_address = f"http://{node.ip}:{node.port}"
@@ -238,6 +283,8 @@ class Validator:
 
         self.save_state()
 
+        self.check_wandb_run()
+
     async def run(self):
         while True:
             try:
@@ -255,6 +302,7 @@ class Validator:
             b = b & ((1 << (b.dtype.itemsize * 8 - 1)) - 1)
             a = (a << 1) | msb
             return a, b
+
         normalized_outputs = []
 
         for i in range(len(outputs)-2):
