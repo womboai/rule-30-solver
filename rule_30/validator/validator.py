@@ -19,10 +19,12 @@ from fiber.validator.client import make_non_streamed_post, make_non_streamed_get
 from fiber.validator.handshake import perform_handshake
 from httpx import AsyncClient, Response
 from numpy.typing import NDArray
+from pydantic import BaseModel
 from substrateinterface import Keypair, SubstrateInterface
 from wandb.sdk.wandb_run import Run
 
 from .config import SUBTENSOR_NETWORK, SUBTENSOR_ADDRESS, NETUID, WALLET_NAME, HOTKEY_NAME
+from ..models import ComputationData
 from ..wandb_config import WANDB_REFRESH_INTERVAL, WANDB_PROJECT, WANDB_ENTITY
 
 logger = get_logger(__name__)
@@ -140,7 +142,13 @@ class Validator:
             for node in self.metagraph.nodes.values()
         ))
 
-        self.valid_miners.extend(*np.where(current_steps == self.step))
+        current_steps = (
+            step_response.json()
+            for step_response in current_steps
+        )
+
+        # TODO implement system where validator keeps track of miner steps
+        self.valid_miners.extend(*np.where(current_steps == np.uint64(1)))
 
     def new_wandb_run(self, block: Block | None = None):
         if not block:
@@ -179,7 +187,7 @@ class Validator:
         if current_block - self.last_wandb_run > WANDB_REFRESH_INTERVAL:
             self.new_wandb_run(current_block)
 
-    async def make_request(self, node: Node, endpoint: str, payload: dict[str, Any] | None = None):
+    async def make_request(self, node: Node, endpoint: str, payload: BaseModel | None = None):
         miner_address = f"http://{node.ip}:{node.port}"
 
         symmetric_key_str, symmetric_key_uuid = await perform_handshake(
@@ -205,7 +213,7 @@ class Validator:
                 symmetric_key_uuid=symmetric_key_uuid,
                 validator_ss58_address=self.keypair.ss58_address,
                 miner_ss58_address=node.hotkey,
-                payload=payload,
+                payload=payload.model_dump(),
                 endpoint=f"/{endpoint}",
             )
         else:
@@ -249,15 +257,13 @@ class Validator:
             self.make_request(
                 node,
                 "compute",
-                {
-                    "parts": chunk
-                }
+                ComputationData(parts=chunk),
             )
             for node, chunk in chunks
         ))
 
-        responses: list[tuple[int, list[int] | None, float]] = [
-            (uid, response.json()["parts"] if response else None, inference_time)
+        responses: list[tuple[int, ComputationData | None, float]] = [
+            (uid, ComputationData.model_validate_json(response.text) if response else None, inference_time)
             for uid, (response, inference_time) in zip(self.valid_miners, responses)
         ]
 
@@ -268,7 +274,7 @@ class Validator:
                 self.scores[uid] = 1 / inference_time
 
         data = [
-            np.array(response, dtype=np.uint64)
+            np.array(response.parts, dtype=np.uint64)
             for _, response, _ in responses
         ]
 
@@ -277,7 +283,7 @@ class Validator:
         bit_index = self.step % 64
         current_row_part = self.current_row[self.step / 64]
 
-        self.center_column[-1] = self.center_column[-1] | (current_row_part >> bit_index << bit_index)
+        self.center_column[-1] |= current_row_part >> bit_index << bit_index
 
         self.step += 1
 
@@ -291,9 +297,8 @@ class Validator:
                 await self.do_step()
             except:
                 logger.error(f"Error in evolution step {self.step}", exc_info=True)
-    
 
-    async def normalize_scores(self, outputs: np.ndarray[np.ndarray[np.uint64]]) -> np.ndarray[np.uint64]:
+    def normalize_response_data(self, outputs: list[NDArray[np.uint64]]) -> NDArray[np.uint64]:
         def rule_30(a: np.uint64) -> np.uint64:
             return np.uint64(a ^ (a << np.uint64(1) | a << np.uint64(2)))
 
