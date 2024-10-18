@@ -1,1 +1,1 @@
-from validator import main
+from .validator import main

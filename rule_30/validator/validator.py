@@ -1,41 +1,51 @@
 import asyncio
 from collections.abc import Iterable
-from itertools import islice, chain
+from itertools import islice
+from math import ceil
 from os import makedirs
 from os.path import exists
 from pathlib import Path
-from time import perf_counter
-from typing import Any, TypeAlias
+from time import perf_counter, sleep
+from typing import TypeAlias
 
 import numpy as np
 import wandb
-from cryptography.fernet import Fernet
 from fiber.chain.chain_utils import load_hotkey_keypair
 from fiber.chain.interface import get_substrate
 from fiber.chain.metagraph import Metagraph
 from fiber.chain.models import Node
+from fiber.chain.weights import set_node_weights
 from fiber.logging_utils import get_logger
-from fiber.validator.client import make_non_streamed_post, make_non_streamed_get
-from fiber.validator.handshake import perform_handshake
 from httpx import AsyncClient, Response
 from numpy.typing import NDArray
 from pydantic import BaseModel
 from substrateinterface import Keypair, SubstrateInterface
 from wandb.sdk.wandb_run import Run
 
-from .config import SUBTENSOR_NETWORK, SUBTENSOR_ADDRESS, NETUID, WALLET_NAME, HOTKEY_NAME
+from .config import SUBTENSOR_NETWORK, SUBTENSOR_ADDRESS, NETUID, WALLET_NAME, HOTKEY_NAME, EPOCH_LENGTH
 from ..models import ComputationData
 from ..wandb_config import WANDB_REFRESH_INTERVAL, WANDB_PROJECT, WANDB_ENTITY
 
 logger = get_logger(__name__)
 
 
-VALIDATOR_VERSION: tuple[int, int, int] = (4, 0, 5)
+VALIDATOR_VERSION: tuple[int, int, int] = (1, 0, 0)
 VALIDATOR_VERSION_STRING = ".".join(map(str, VALIDATOR_VERSION))
+
+WEIGHTS_VERSION = (
+    VALIDATOR_VERSION[0] * 10000 +
+    VALIDATOR_VERSION[1] * 100 +
+    VALIDATOR_VERSION[2]
+)
+
 
 Block: TypeAlias = int
 Uid: TypeAlias = int
 SS58Key: TypeAlias = str
+
+
+class UnrecoverableError(Exception):
+    pass
 
 
 class Validator:
@@ -51,6 +61,8 @@ class Validator:
 
     valid_miners: list[Uid]
     hotkeys: list[SS58Key]
+
+    last_metagraph_sync: Block
 
     last_wandb_run: Block
     wandb_run: Run
@@ -71,15 +83,21 @@ class Validator:
 
         self.metagraph.sync_nodes()
 
+        self.valid_miners = []
+        self.hotkeys = list(self.metagraph.nodes)
+        self.scores = [0.0] * len(self.metagraph.nodes)
+
         self.client = AsyncClient()
 
         self.step = np.uint64(1)
         self.current_row = np.array([1], dtype=np.uint64)
         self.center_column = np.array([1], dtype=np.uint64)
-        self.valid_miners = []
-        self.hotkeys = list(self.metagraph.nodes)
 
-        self.new_wandb_run()
+        self.load_state()
+
+    def check_registered(self):
+        if self.keypair.ss58_address not in self.metagraph.nodes:
+            raise UnrecoverableError(f"Hotkey {self.keypair.ss58_address} is not registered in {self.metagraph.netuid}")
 
     @property
     def state_path(self):
@@ -98,7 +116,7 @@ class Validator:
         return full_path / "state.npz"
 
     def save_state(self):
-        logger.log("save_state")
+        logger.info("save_state")
 
         np.savez(
             self.state_path,
@@ -110,7 +128,7 @@ class Validator:
         )
 
     def load_state(self):
-        logger.log("load_state")
+        logger.info("load_state")
 
         path = self.state_path
 
@@ -122,33 +140,73 @@ class Validator:
         self.step = state["step"]
         self.current_row = state["current_row"]
         self.center_column = state["center_column"]
-        self.valid_miners = state["valid_miners"]
+        self.valid_miners = list(state["valid_miners"])
         self.hotkeys = state["hotkeys"]
 
-    def sync(self):
-        logger.log("sync")
+    async def sync(self, block: Block | None = None):
+        logger.info("sync")
 
         self.metagraph.sync_nodes()
+
+        if not block:
+            block = self.substrate.get_block_number(None)
+
+        self.last_metagraph_sync = block
+
+        self.check_registered()
+
         self.valid_miners.clear()
 
-        for hotkey, node in self.metagraph.nodes.items():
-            if hotkey != self.hotkeys[node.node_id]:
-                self.hotkeys[node.node_id] = hotkey
+        if len(self.hotkeys) != len(self.metagraph.nodes):
+            new_scores = [0.0] * len(self.metagraph.nodes)
+            length = len(self.hotkeys)
+            new_scores[:length] = self.scores[:length]
 
-        logger.log("Checking active miners")
+            self.scores = new_scores
 
-        current_steps = asyncio.gather(*(
+        nodes = self.nodes_list()
+
+        for uid, hotkey in enumerate(self.hotkeys):
+            if hotkey not in self.metagraph.nodes:
+                self.scores[uid] = 0.0
+
+        self.hotkeys = [node.hotkey for node in nodes]
+
+        logger.info("Checking active miners")
+
+        current_steps = await asyncio.gather(*(
             self.make_request(node, "current_step")
             for node in self.metagraph.nodes.values()
         ))
 
-        current_steps = (
-            step_response.json()
-            for step_response in current_steps
-        )
+        current_steps = [
+            step_response.json() if step_response else 0
+            for step_response, _ in current_steps
+        ]
 
         # TODO implement system where validator keeps track of miner steps
         self.valid_miners.extend(*np.where(current_steps == np.uint64(1)))
+
+        if block - self.metagraph.nodes[self.keypair.ss58_address].last_updated >= EPOCH_LENGTH:
+            self.set_weights()
+
+    def set_weights(self):
+        logger.info("set_weights")
+
+        if sum(self.scores) <= 0.0:
+            weights = [1.0] * len(self.metagraph.nodes)
+        else:
+            weights = self.scores
+
+        set_node_weights(
+            self.substrate,
+            self.keypair,
+            node_ids=list(range(len(self.metagraph.nodes))),
+            node_weights=weights,
+            netuid=self.metagraph.netuid,
+            validator_node_id=self.hotkeys.index(self.keypair.ss58_address),
+            version_key=WEIGHTS_VERSION,
+        )
 
     def new_wandb_run(self, block: Block | None = None):
         if not block:
@@ -190,17 +248,8 @@ class Validator:
     async def make_request(self, node: Node, endpoint: str, payload: BaseModel | None = None):
         miner_address = f"http://{node.ip}:{node.port}"
 
-        symmetric_key_str, symmetric_key_uuid = await perform_handshake(
-            keypair=self.keypair,
-            httpx_client=self.client,
-            server_address=miner_address,
-            miner_hotkey_ss58_address=node.hotkey,
-        )
-
-        if symmetric_key_str is None or symmetric_key_uuid is None:
-            return None
-
-        start = perf_counter()
+        try:
+            start = perf_counter()
 
         if payload:
             fernet = Fernet(symmetric_key_str)
@@ -240,11 +289,29 @@ class Validator:
         return nodes
 
     async def do_step(self):
-        logger.log(f"Evolution step {self.step}")
+        logger.info(f"Evolution step {self.step}")
+
+        current_block = self.substrate.get_block_number(None)  # type: ignore
+
+        elapsed_blocks = current_block - self.last_metagraph_sync
+
+        if elapsed_blocks >= EPOCH_LENGTH:
+            await self.sync(current_block)
+
+            elapsed_blocks = 0
+
+        while not len(self.valid_miners):
+            logger.info(f"Not enough miners to compute step, waiting until next sync")
+
+            sleep(EPOCH_LENGTH - elapsed_blocks)
+
+            current_block = self.substrate.get_block_number(None)  # type: ignore
+
+            await self.sync(current_block)
 
         iterator = iter(self.current_row)
 
-        chunk_size = np.ceil(len(self.current_row) / len(self.valid_miners))
+        chunk_size = ceil(len(self.current_row) // len(self.valid_miners))
 
         nodes = self.nodes_list()
 
@@ -281,7 +348,7 @@ class Validator:
         self.current_row = self.normalize_response_data(data)
 
         bit_index = self.step % 64
-        current_row_part = self.current_row[self.step / 64]
+        current_row_part = self.current_row[self.step // 64]
 
         self.center_column[-1] |= current_row_part >> bit_index << bit_index
 
@@ -292,9 +359,15 @@ class Validator:
         self.check_wandb_run()
 
     async def run(self):
+        await self.sync()
+
+        self.new_wandb_run()
+
         while True:
             try:
                 await self.do_step()
+            except (UnrecoverableError, KeyboardInterrupt):
+                raise
             except:
                 logger.error(f"Error in evolution step {self.step}", exc_info=True)
 
@@ -321,6 +394,8 @@ class Validator:
 
         normalized_outputs = []
 
+        i = 0
+
         for i in range(len(outputs) - 1): 
             a = np.uint64(outputs[i][-1])
             b = np.uint64(outputs[i + 1][0])
@@ -332,10 +407,15 @@ class Validator:
 
         normalized_outputs.extend(outputs[i].astype(np.uint64))
 
-        normalized_outputs.extend(outputs[-1].astype(np.uint64))
+        if i:
+            normalized_outputs.extend(outputs[-1].astype(np.uint64))
 
         return np.array(normalized_outputs, dtype=np.uint64)
 
 
+async def run():
+    await Validator().run()
+
+
 def main():
-    asyncio.run(Validator().run())
+    asyncio.run(run())

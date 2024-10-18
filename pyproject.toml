@@ -16,8 +16,8 @@ fiber = { git = "https://github.com/rayonlabs/fiber", tag = "1.0.0" }
 fiber = ["full"]
 
 [tool.poetry.scripts]
-start_miner = "rule30.miner:main"
-start_validator = "rule30.validator:main"
+start_miner = "rule_30.miner:main"
+start_validator = "rule_30.validator:main"
 
 [build-system]
 requires = ["poetry-core"]

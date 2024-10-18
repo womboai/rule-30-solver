@@ -1,1 +1,1 @@
-from miner import main, app
+from .miner import main, app
